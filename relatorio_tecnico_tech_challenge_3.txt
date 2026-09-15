@@ -1,0 +1,253 @@
+================================================================================
+RELATÓRIO TÉCNICO - TECH CHALLENGE FASE 3
+Assistente Médico Inteligente com Fine-Tuning (LoRA) + LangChain/LangGraph
+================================================================================
+
+Autor: Igor de Sousa (RM 371788)
+Curso: FIAP - Pós-Tech IA para Devs - 9IADT - Grupo 92
+Repositório: tech-challenge3-fiap
+Vídeo de demonstração: https://youtu.be/CtX37T3m7zo
+
+--------------------------------------------------------------------------------
+1. INTRODUÇÃO E CONTEXTO DO DESAFIO
+--------------------------------------------------------------------------------
+
+O desafio propõe a criação de um assistente virtual médico treinado com dados
+próprios de um hospital fictício, capaz de:
+  a) Auxiliar em condutas clínicas e responder dúvidas de médicos com base em
+     protocolos internos;
+  b) Orquestrar fluxos de decisão automatizados (verificação de exames
+     pendentes, sugestão de tratamento, emissão de alertas) usando LangChain
+     e LangGraph;
+  c) Operar com limites de segurança claros (nunca prescrever diretamente sem
+     validação humana), com logging e explicabilidade das respostas.
+
+A solução foi dividida em dois notebooks complementares:
+  - tech_challenge_3_fine_tuning.ipynb: preparo de dados, anonimização,
+    curadoria e fine-tuning (LoRA) do modelo base Llama-3-8B.
+  - langgraph_langchain_assistente_medico.ipynb: pipeline RAG sobre os
+    protocolos internos (PDFs), base simulada de prontuários e grafo de
+    agente (LangGraph) que consome o modelo fine-tuned.
+
+--------------------------------------------------------------------------------
+2. PROCESSO DE FINE-TUNING
+--------------------------------------------------------------------------------
+
+2.1 Fontes de dados utilizadas
+  - Dataset público "healthqa-br" (Larxel, Hugging Face): perguntas e
+    respostas clínicas em português, usadas como base de conhecimento geral.
+  - Planilha interna simulada "laudos-fraturas.xlsx" (51 linhas): laudos
+    estruturados, diagnóstico e conduta/tratamento sugerido, representando os
+    "modelos de laudos e procedimentos internos" exigidos pelo desafio.
+  - Protocolos clínicos internos em PDF (pasta protocolos/): diretrizes do
+    Ministério da Saúde para Diabetes Melito Tipo 2 e para Fratura do Colo do
+    Fêmur em Idosos, usados como fonte de contexto (RAG) tanto no treino
+    quanto no assistente final. Apenas 2 foram utilizados, para não onerar muito 
+    o modelo a ser treinado.
+
+2.2 Pré-processamento
+  - As perguntas/respostas do dataset público foram resumidas via chamada a
+    um LLM da OpenAI (função summarize_dataset), extraindo os campos
+    estruturados "symptom", "diagnosis" e "treatment" em formato JSON,
+    processados em lote e salvos incrementalmente (a cada 50 registros) para
+    evitar perda de progresso em caso de falha.
+  - Os laudos internos (Excel) foram selecionados nas colunas relevantes
+    ("Laudo estruturado", "Diagnóstico", "Tratamento/conduta sugerida") e
+    combinados ao dataset público.
+
+2.3 Anonimização
+  - anonimize_text: expressões regulares mascarando CPF, telefone, datas e
+    números de prontuário/registro.
+  - remove_names: NER com spaCy (modelo em português) removendo entidades do
+    tipo pessoa, local e organização (PER, LOC, ORG), aplicado sobre os
+    laudos internos antes de entrarem no dataset de treino.
+
+2.4 Curadoria
+  - remove_duplicates: elimina registros com o mesmo "symptom" normalizado.
+  - filter_incomplete: descarta registros sem symptom/diagnosis/treatment.
+  - Resultado medido na execução: curadoria removeu 234 registros
+    (5.682 -> 5.448 exemplos finais no dataset consolidado).
+
+2.5 Enriquecimento com contexto de protocolo (RAG aplicado ao treino)
+  - Os PDFs de protocolos foram extraídos (pypdf) e divididos em chunks de
+    500 caracteres com sobreposição de 80 (1.142 trechos carregados).
+  - Cada exemplo de treino recebeu, via similaridade de embeddings
+    (SentenceTransformer "paraphrase-multilingual-MiniLM-L12-v2", limiar de
+    cosseno 0,35), o trecho de protocolo mais relevante como
+    "protocol_context" — 5.355 de 5.448 exemplos (98,3%) receberam contexto
+    de protocolo interno; o restante permaneceu sem protocolo associado,
+    intencionalmente, para que o modelo aprendesse a responder também sem
+    esse contexto.
+
+2.6 Configuração do treinamento (LoRA / Unsloth)
+  - Modelo base: unsloth/llama-3-8b-bnb-4bit (quantizado em 4-bit).
+  - LoRA: r=16, alpha=16, dropout=0, aplicado às projeções
+    q/k/v/o/gate/up/down_proj.
+  - Parâmetros treináveis: 41.943.040 de 8.072.204.288 (0,52% do modelo).
+  - SFTTrainer (TRL): batch size 2 por dispositivo, gradient accumulation 4
+    (batch efetivo 8), max_steps=60, learning rate 2e-4, otimizador
+    adamw_8bit, scheduler linear, seed=47.
+  - Formato de prompt: template Alpaca (Instruction / Input / Response).
+  - Hardware observado no log de execução: 1x GPU Tesla T4 (Google Colab).
+
+2.7 Validação qualitativa (inferência pós-treino)
+  Dois testes manuais foram executados ao final do notebook de fine-tuning:
+  - Sem contexto de protocolo: o modelo gerou diagnóstico e sugestão de
+    conduta plausíveis para um caso de gestante com fatores de risco para
+    diabetes gestacional.
+  - Com contexto de protocolo (trecho do PDF de Diabetes Tipo 2 injetado no
+    input): o modelo produziu resposta mais curta e específica,
+    demonstrando capacidade de condicionar a saída ao protocolo fornecido.
+
+  [OBSERVAÇÃO PARA O RELATÓRIO FINAL]
+  O requisito do desafio pede explicitamente "avaliação do modelo e análise
+  dos resultados". O notebook atual demonstra apenas 2 exemplos manuais de
+  inferência e o log de treinamento não expõe a curva de loss em texto (foi
+  renderizada como tabela HTML dentro do notebook, não capturada aqui).
+  Recomenda-se, antes da entrega final, complementar esta seção com:
+    - Curva de loss por step (extraída de trainer_stats.metrics ou do log
+      de treino);
+    - Um conjunto de validação hold-out (ex.: 10-20 casos não vistos no
+      treino) com avaliação qualitativa estruturada (correto / parcialmente
+      correto / incorreto) e, se possível, uma métrica quantitativa simples
+      (ex.: similaridade semântica entre resposta gerada e resposta
+      esperada).
+
+--------------------------------------------------------------------------------
+3. ASSISTENTE MÉDICO (LANGCHAIN + LANGGRAPH)
+--------------------------------------------------------------------------------
+
+3.1 Carregamento do modelo
+  - O adaptador LoRA salvo (lora_model/) é carregado sobre o modelo base em
+    4-bit via PEFT e exposto ao LangChain através de HuggingFacePipeline.
+  - Fallback controlado: se não houver GPU ou o adaptador não for
+    encontrado, a variável "llm" permanece None e o grafo passa a responder
+    em modo offline/simulado (didático), sem quebrar a execução do notebook.
+
+3.2 RAG sobre protocolos internos
+  - Os mesmos PDFs de protocolos são carregados com PyPDFLoader e divididos
+    com RecursiveCharacterTextSplitter (chunk_size=500, overlap=80).
+  - Embeddings: HuggingFaceEmbeddings com
+    "paraphrase-multilingual-MiniLM-L12-v2"; indexação em FAISS; retriever
+    consultado a cada pergunta clínica.
+
+3.3 Base estruturada de prontuários (simulada)
+  - Implementada em SQLite em memória, representando a integração com o
+    "registro de pacientes" exigida pelo desafio (em produção seria o
+    prontuário eletrônico real do hospital).
+  - Dois pacientes de exemplo (P001, com exame pendente; P002, sem
+    pendências), usados para demonstrar o fluxo de alerta.
+
+3.4 Orquestração via LangGraph
+  Estado compartilhado (EstadoAssistente) contendo: patient_id, pergunta do
+  médico, dados do paciente, alerta, intenção classificada, contexto de
+  protocolo, fontes do protocolo, sugestão gerada e flag de revisão
+  obrigatória.
+
+  Nós do grafo e fluxo:
+    carregar_paciente -> verificar_exames -> classificar_intencao
+        -(dúvida clínica)-> buscar_protocolo -> gerar_sugestao
+             -> validar_seguranca -> END
+        -(fora de escopo)-> resposta_fora_do_escopo -> END
+
+  - carregar_paciente / verificar_exames_pendentes: consultam o prontuário
+    simulado e emitem alerta textual quando há exame pendente.
+  - classificar_intencao: roteamento por palavras-chave clínicas
+    (diagnóstico, sintoma, tratamento, conduta, protocolo) versus perguntas
+    administrativas/fora de escopo.
+  - buscar_protocolo: nó de "retrieve" do RAG, retorna o texto do(s) trecho(s)
+    mais relevante(s) e a lista de fontes (nome dos PDFs).
+  - gerar_sugestao: monta o prompt no formato Alpaca combinando pergunta,
+    dados do paciente e contexto de protocolo, e invoca o LLM fine-tuned
+    (ou o modo offline, se llm=None).
+  - validar_seguranca: camada de segurança — regex detecta padrões de
+    dosagem/via de administração (mg, ml, mcg, g, comprimidos, gotas) na
+    resposta gerada; se detectado, marca flag_revisao_obrigatoria=True;
+    em todos os casos, anexa disclaimer fixo informando que a sugestão não
+    substitui avaliação clínica e exige validação médica.
+  - resposta_fora_do_escopo: rota alternativa para perguntas não clínicas,
+    sem acionar LLM nem RAG.
+
+3.5 Execução de casos de exemplo (evidência de funcionamento ponta a ponta)
+  Três cenários foram executados ao final do notebook:
+
+  Caso 1 - Paciente P001, pergunta clínica (diabetes + possível fratura)
+    - Alerta emitido: "Exame pendente: Hemograma completo"
+    - Intenção classificada: duvida_clinica
+    - Fonte usada: "Diabete melito tipo 2.pdf"
+    - flag_revisao_obrigatoria: True (resposta continha padrão numérico de
+      dosagem, corretamente sinalizado pelo filtro de segurança)
+
+  Caso 2 - Paciente P001, pergunta clínica (dor no fêmur após queda)
+    - Alerta emitido: "Exame pendente: Hemograma completo"
+    - Intenção classificada: duvida_clinica
+    - Fonte usada: "Fratura do Colo do Fêmur em Idosos - Tratamento -
+      Diretrizes Brasileiras.pdf"
+    - flag_revisao_obrigatoria: False
+
+  Caso 3 - Paciente P002, pergunta administrativa (setor de faturamento)
+    - Intenção classificada: fora_de_escopo
+    - Resposta padrão de encaminhamento, sem uso de LLM/RAG
+    - flag_revisao_obrigatoria: False
+
+  Esses três casos cobrem exatamente os fluxos exigidos pelo desafio: alerta
+  por exame pendente, sugestão de conduta contextualizada por protocolo, e
+  rota de recusa para fora do escopo clínico.
+
+--------------------------------------------------------------------------------
+4. SEGURANÇA, EXPLICABILIDADE E AUDITORIA
+--------------------------------------------------------------------------------
+
+  - Limite de atuação: a instrução do modelo (INSTRUCAO_DIAGNOSTICO) proíbe
+    explicitamente prescrição direta; a camada validar_seguranca funciona
+    como um segundo controle independente do modelo, via regex.
+  - Disclaimer obrigatório: toda resposta gerada pelo fluxo clínico recebe,
+    de forma automática, o aviso de que a sugestão não substitui avaliação
+    médica e exige validação humana.
+  - Explicabilidade: o nó buscar_protocolo devolve as fontes (nomes dos
+    arquivos PDF) usadas para compor a resposta, expostas ao final da
+    execução como "Fontes usadas" — atende ao requisito de indicar a origem
+    da informação.
+  - Logging/auditoria: cada nó do grafo grava um evento estruturado em JSON
+    (etapa, patient_id, dados relevantes, timestamp UTC) em um arquivo de
+    log de auditoria no Google Drive, cobrindo carregamento de paciente,
+    verificação de exames, classificação de intenção, busca de protocolo,
+    geração de sugestão e validação de segurança.
+
+--------------------------------------------------------------------------------
+5. ORGANIZAÇÃO DO PROJETO E ARQUIVOS ENTREGUES
+--------------------------------------------------------------------------------
+
+  tech-challenge3-fiap-main/
+    |- tech_challenge_3_fine_tuning.ipynb   (pipeline de fine-tuning)
+    |- langgraph_langchain_assistente_medico.ipynb (assistente RAG+LangGraph)
+    |- laudos-fraturas.xlsx                 (dataset interno simulado, 51 linhas)
+    |- symptom_x_diagnosis.json             (dataset sintético symptom->diagnóstico)
+    |- protocolos/
+    |    |- Diabete melito tipo 2.pdf
+    |    |- Fratura do Colo do Fêmur em Idosos - Tratamento - Diretrizes...pdf
+    |- api-key.txt                          (template de variável de ambiente)
+    |- README.md                            (instruções completas de execução)
+    |- LICENSE
+
+  Observação de segurança: o arquivo api-key.txt contém apenas um placeholder
+  ("OPENAI_API_KEY=sk-proj-... [Preencha com sua chave OpenAI]"), sem chave
+  real exposta no repositório.
+
+================================================================================
+CONCLUSÃO E CONSIDERAÇÕES FINAIS
+================================================================================
+Algo interessante a se considerar foi a necessidade de contratar mais unidades de processamento
+no Colab, pois o treinamento do modelo e geração de outputs requeriam muito poder computacional.
+Caso seja executado apenas poucas vezes, isso não chega a ser necessário, é possível testar com
+a assinatura Free do Colab.
+
+Referente aos protocolos médicos, seria interessante mais pdfs para termos protocolos e 
+diferentes diretrizes, considerando que os datasets utilizados tem vários diagnósticos. Apenas
+aplicar na pasta protocolos já permite que o notebook leia e aplique no treinamento do modelo.
+
+Outro ponto importante: os resultados do modelo nem sempre vão ser gerados com exatidão. Isso é
+devido a geração do primeiro arquivo JSON, utilizando o gpt. Pela limitação de tokens por 
+custo/velocidade, os sintomas e tratamentos foram resumidos a poucas frases, o que também resulta 
+em valores menos precisos. Tendo mais poder de processamento e um orçamento maior disponibilizado, 
+os resultados podem melhor significativamente.
